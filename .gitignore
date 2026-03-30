@@ -1,0 +1,21 @@
+# 환경변수 / API 키
+.env
+*.env
+config/youtube_token.json
+config/client_secrets.json
+
+# 출력 파일
+output/
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# 시스템
+.DS_Store
+Thumbs.db
+*.log
