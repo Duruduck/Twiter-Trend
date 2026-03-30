@@ -31,25 +31,53 @@ def fetch_content(url: str) -> dict:
     """URL → {title, text, source}"""
     if _is_twitter_url(url):
         return _prompt_twitter_text(url)
+
+    # 네이버 블로그 → 모바일 URL로 변환 (본문 크롤링 가능)
+    if "blog.naver.com" in url:
+        url = _naver_blog_to_mobile(url)
+
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
         resp.encoding = resp.apparent_encoding
         soup = BeautifulSoup(resp.text, "html.parser")
+
         for tag in soup(["script", "style", "nav", "footer", "header", "aside", "iframe"]):
             tag.decompose()
+
         title = ""
         if soup.find("h1"):
             title = soup.find("h1").get_text(strip=True)
         elif soup.find("title"):
             title = soup.find("title").get_text(strip=True)
-        article = soup.find("article") or soup.find("main") or soup.find("body")
+
+        # 네이버 블로그 본문 선택자 우선
+        article = (
+            soup.find("div", {"class": "se-main-container"})
+            or soup.find("div", {"id": "postViewArea"})
+            or soup.find("div", {"class": "post-view"})
+            or soup.find("article")
+            or soup.find("main")
+            or soup.find("body")
+        )
         text = article.get_text(separator=" ", strip=True) if article else ""
         text = re.sub(r"\s+", " ", text).strip()[:3000]
+
         return {"title": title or url, "text": text, "source": url}
+
     except Exception as e:
         print(f"  ⚠️  URL 수집 실패: {e}")
         return {"title": url, "text": url, "source": url}
+
+
+def _naver_blog_to_mobile(url: str) -> str:
+    """네이버 블로그 PC URL → 모바일 URL 변환."""
+    url = url.replace("blog.naver.com", "m.blog.naver.com")
+    m = re.search(r"blogId=([^&]+)&logNo=([^&]+)", url)
+    if m:
+        blog_id, log_no = m.group(1), m.group(2)
+        url = f"https://m.blog.naver.com/{blog_id}/{log_no}"
+    return url
 
 
 def _is_twitter_url(url: str) -> bool:
@@ -202,12 +230,10 @@ def _build_combined_text(topic, news, web):
         parts.append("[뉴스]")
         for i, n in enumerate(news[:5], 1):
             parts.append(f"{i}. {n['title']}")
-            if n.get("description"):
-                parts.append(f"   {n['description'][:150]}")
+            if n.get("description"): parts.append(f"   {n['description'][:150]}")
     if web:
         parts.append("\n[웹 검색 결과]")
         for i, w in enumerate(web[:5], 1):
             parts.append(f"{i}. {w['title']}")
-            if w.get("snippet"):
-                parts.append(f"   {w['snippet'][:150]}")
+            if w.get("snippet"): parts.append(f"   {w['snippet'][:150]}")
     return "\n".join(parts)

@@ -4,12 +4,19 @@ pipeline.py
 
 실행:
   python pipeline.py
+  python pipeline.py --url "https://blog.naver.com/..."
   python pipeline.py --url "https://x.com/..."
   python pipeline.py --topic "주제 직접 입력"
 """
 import os
 import sys
 from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv 없으면 환경변수 직접 설정 필요
 
 from content_fetcher import fetch_content, fetch_topic_context
 from image_fetcher import fetch_image
@@ -26,7 +33,7 @@ OUTPUT_DIR = Path("output")
 def run():
     import argparse
     parser = argparse.ArgumentParser(description="Shorts & Tweet 자동화 파이프라인")
-    parser.add_argument("--url",   type=str, default="", help="X(트위터) URL 직접 입력")
+    parser.add_argument("--url",   type=str, default="", help="URL 직접 입력 (블로그/뉴스/X)")
     parser.add_argument("--topic", type=str, default="", help="주제 직접 입력")
     args = parser.parse_args()
 
@@ -35,20 +42,85 @@ def run():
 
     if args.url:
         print("\n" + "─" * 52)
-        print(" [1/6] X URL 컨텍스트 수집 중...")
+        print(" [1/6] URL 콘텐츠 수집 중...")
         print("─" * 52)
-        try:
-            context = fetch_tweet_context(args.url)
-            topic   = context["summary"]["topic"]
+
+        TWITTER_DOMAINS = ("twitter.com", "x.com", "t.co")
+        is_twitter = any(d in args.url for d in TWITTER_DOMAINS)
+
+        if is_twitter:
+            print(f"  URL: {args.url}")
+            print()
+            print("  트위터 API 없이 동작하려면 트윗 내용을 붙여넣어 주세요.")
+            print("  (입력 후 빈 줄에서 Enter)")
+            print()
+            lines = []
+            while True:
+                try:
+                    line = input("  > ")
+                except (EOFError, KeyboardInterrupt):
+                    sys.exit(0)
+                if line == "" and lines:
+                    break
+                lines.append(line)
+            tweet_text = " ".join(lines).strip()
+            if not tweet_text:
+                _err("트윗 내용이 없습니다.")
+                sys.exit(1)
+
+            import re as _re
+            words = _re.findall(r"[가-힣A-Za-z]{2,}", tweet_text)
+            stopwords = {"RT","the","and","for","that","this","있다","없다","한다","됩니다","합니다","입니다","것이","이번","오늘","지금","https","http","com","www"}
+            keywords = [w for w in words if w not in stopwords][:5]
+            topic = " ".join(keywords[:3]) if keywords else tweet_text[:30]
+
             content = {
-                "title": topic,
-                "text":  context["summary"]["combined_text"],
+                "title":  topic,
+                "text":   tweet_text,
                 "source": args.url,
-                "twitter_context": context,
+                "twitter_context": {
+                    "original":     {"text": tweet_text},
+                    "quote_tweets": [],
+                    "related":      [],
+                    "summary": {
+                        "topic":          topic,
+                        "combined_text":  f"[원본 트윗]\n{tweet_text}",
+                        "sentiment_hint": "",
+                    },
+                },
             }
-        except Exception as e:
-            _err(str(e))
-            sys.exit(1)
+            print(f"\n  ✓ 주제: {topic}")
+
+        else:
+            # 일반 URL (네이버 블로그, 뉴스 등) → 자동 크롤링
+            print(f"  → URL 본문 수집 중: {args.url}")
+            try:
+                content   = fetch_content(args.url)
+                body_text = content.get("text", "")
+                title     = content.get("title", "")
+                import re as _re
+                # 본문 앞 500자에서 키워드 추출 (제목보다 본문이 더 정확)
+                source_text = body_text[:500] if body_text else title
+                words = _re.findall(r"[가-힣]{2,}", source_text)
+                stopwords = {"있다","없다","한다","됩니다","합니다","입니다","것이","이번","오늘",
+                             "지금","그리고","하지만","그래서","때문","이후","이전","관련","블로그",
+                             "네이버","포스팅","내용","글쓴","작성","공유","댓글","좋아요","구독"}
+                keywords = []
+                seen = set()
+                for w in words:
+                    if w not in stopwords and w not in seen:
+                        keywords.append(w)
+                        seen.add(w)
+                    if len(keywords) >= 4:
+                        break
+                topic = " ".join(keywords) if keywords else title
+                content["title"] = topic
+                print(f"  ✓ 제목: {title}")
+                print(f"  ✓ 본문: {len(body_text)}자 수집")
+                print(f"  ✓ 추출 키워드: {topic}")
+            except Exception as e:
+                _err(f"URL 수집 실패: {e}")
+                sys.exit(1)
 
     elif args.topic:
         topic   = args.topic
@@ -68,7 +140,7 @@ def run():
     script, tweet_drafts, chosen_tweet = \
         _step_review(topic, action, script, tweet_drafts, image_path)
 
-    _step_upload(action, chosen_tweet, video_path, topic, script)
+    _step_upload(action, chosen_tweet, video_path, topic)
 
 
 def _step_collect_trends() -> dict:
@@ -81,12 +153,10 @@ def _step_collect_trends() -> dict:
             _print_trends(trends)
             return trends
         except ValueError as e:
-            _err(str(e))
-            sys.exit(1)
+            _err(str(e)); sys.exit(1)
         except Exception as e:
             _err(f"수집 실패: {e}")
-            if _ask("다시 시도할까요? (y/n): ") == "y":
-                continue
+            if _ask("다시 시도할까요? (y/n): ") == "y": continue
             sys.exit(1)
 
 
@@ -102,7 +172,7 @@ def _print_trends(trends: dict):
     print("\n  [ 대한민국 전체 트렌딩 Top 3 ]")
     if ktr:
         for t in ktr:
-            vol = f"{t['tweet_volume']:,}" if t.get("tweet_volume") else "—"
+            vol = f"{t['tweet_volume']:,}" if t.get("tweet_volume") else "─"
             print(f"   {t['rank'] + len(tl)}. {t['topic']:<28}  트윗 {vol}")
     else:
         print("   (트렌딩 데이터 없음)")
@@ -115,9 +185,7 @@ def _step_pick_topic(trends: dict) -> str:
     print("\n" + "─" * 52)
     print(" [2/6] 주제를 선택하세요")
     print("─" * 52)
-    print("  번호 입력 → 해당 주제 선택")
-    print("  d         → 직접 입력")
-    print("  r         → 트렌드 다시 수집")
+    print("  번호 입력 → 해당 주제 선택 / d → 직접 입력 / r → 다시 수집")
     print()
     while True:
         raw = _ask("  선택: ").strip().lower()
@@ -144,9 +212,7 @@ def _step_pick_action() -> str:
     print("\n" + "─" * 52)
     print(" [3/6] 무엇을 만들까요?")
     print("─" * 52)
-    print("  1. 트윗만 작성")
-    print("  2. 쇼츠만 제작")
-    print("  3. 트윗 + 쇼츠 둘 다")
+    print("  1. 트윗만 작성 / 2. 쇼츠만 제작 / 3. 트윗 + 쇼츠 둘 다")
     print()
     while True:
         raw = _ask("  선택 (1/2/3): ").strip()
@@ -175,7 +241,7 @@ def _step_generate(topic: str, action: str, content: dict | None = None):
             if related:
                 twitter_ctx = {
                     "quote_tweets": [],
-                    "related": related,
+                    "related":      related,
                     "summary": {
                         "sentiment_hint": "",
                         "combined_text":  "\n".join(f"- {t['text']}" for t in related[:5]),
@@ -245,14 +311,15 @@ def _step_review(topic, action, script, tweet_drafts, image_path):
                 print(f"      {text}")
         if action in ("shorts", "both"):
             mp4 = OUTPUT_DIR / "shorts.mp4"
-            print(f"\n  [ 쇼츠 영상 ] {mp4} ({'존재' if mp4.exists() else '없음'})")
+            print(f"\n  [ 쇼츠 영상 ] {mp4} ({('존재' if mp4.exists() else '없음')})")
+            if image_path:
+                print(f"  사진: {image_path}")
         print("\n  ─────────────────────────────────")
         if tweet_drafts:
-            print("  tw1 / tw2 / tw3  — 트윗 버전 선택")
-        print("  s:내용   — 스크립트 재생성  (예: s:더 강렬하게)")
-        print("  t:내용   — 트윗 재생성      (예: t:더 재미있게)")
-        print("  ok       — 업로드 진행")
-        print("  q        — 종료")
+            print("  tw1/tw2/tw3  — 트윗 버전 선택")
+        print("  s:내용  — 스크립트 재생성  (예: s:더 강렬하게)")
+        print("  t:내용  — 트윗 재생성      (예: t:더 재미있게)")
+        print("  ok      — 업로드 진행 / q — 종료")
         print()
         raw = _ask("  입력: ").strip().lower()
         if raw == "ok":
@@ -261,8 +328,7 @@ def _step_review(topic, action, script, tweet_drafts, image_path):
                 print("  (트윗 버전 미선택 → 공감형 자동 선택)")
             break
         elif raw == "q":
-            print("  종료합니다.")
-            sys.exit(0)
+            print("  종료합니다."); sys.exit(0)
         elif tweet_drafts and raw in ("tw1", "tw2", "tw3"):
             key = {"tw1": "info", "tw2": "emotion", "tw3": "hashtag"}[raw]
             chosen_tweet = tweet_drafts[key]
@@ -270,15 +336,13 @@ def _step_review(topic, action, script, tweet_drafts, image_path):
         elif raw.startswith("s:"):
             inst = raw[2:].strip()
             print(f"  → 스크립트 재생성 중 ({inst})...")
-            c = {"title": topic, "text": f"{topic}. {inst}", "source": "direct"}
-            script = generate_script(c)
+            script = generate_script({"title": topic, "text": f"{topic}. {inst}", "source": "direct"})
             if tweet_drafts:
                 tweet_drafts = generate_tweet_drafts(topic, script)
             print("  ✓ 재생성 완료")
         elif raw.startswith("t:"):
             if not tweet_drafts:
-                print("  트윗 모드가 아닙니다.")
-                continue
+                print("  트윗 모드가 아닙니다."); continue
             inst = raw[2:].strip()
             print(f"  → 트윗 재생성 중 ({inst})...")
             ms = dict(script)
@@ -290,7 +354,7 @@ def _step_review(topic, action, script, tweet_drafts, image_path):
     return script, tweet_drafts, chosen_tweet
 
 
-def _step_upload(action: str, chosen_tweet, video_path, topic: str, script: dict = None):
+def _step_upload(action: str, chosen_tweet, video_path, topic: str):
     print("\n" + "─" * 52)
     print(" [6/6] 업로드")
     print("─" * 52)
@@ -313,19 +377,12 @@ def _step_upload(action: str, chosen_tweet, video_path, topic: str, script: dict
         else:
             if _ask("  YouTube에 업로드할까요? (y/n): ").strip().lower() == "y":
                 privacy = _ask("  공개 범위 (public/unlisted/private) [기본: public]: ").strip()
-                if privacy not in ("public", "unlisted", "private"):
-                    privacy = "public"
+                if privacy not in ("public", "unlisted", "private"): privacy = "public"
                 try:
-                    result = upload_shorts(
-                        video_path=video_path,
-                        title=topic,
-                        tags=(script or {}).get("keywords", []),
-                        privacy=privacy,
-                    )
+                    result = upload_shorts(video_path=video_path, title=topic, privacy=privacy)
                     print(f"  ✓ YouTube 업로드 완료: {result['url']}")
                 except Exception as e:
                     _err(f"YouTube 업로드 실패: {e}")
-                    print(f"  파일은 로컬에 저장됨: {video_path.resolve()}")
             else:
                 print(f"  업로드 건너뜀. 파일: {video_path.resolve()}")
     print("\n  ✅ 파이프라인 완료!")
@@ -335,19 +392,15 @@ def _ask(prompt: str) -> str:
     try:
         return input(prompt)
     except (EOFError, KeyboardInterrupt):
-        print("\n  중단됨.")
-        sys.exit(0)
-
+        print("\n  중단됨."); sys.exit(0)
 
 def _err(msg: str):
     print(f"\n  ⚠️  {msg}")
-
 
 def _print_banner():
     print("\n" + "=" * 52)
     print("  Shorts & Tweet 자동화 파이프라인")
     print("=" * 52)
-
 
 if __name__ == "__main__":
     run()
