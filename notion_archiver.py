@@ -1,253 +1,280 @@
 """
 notion_archiver.py
-매일 오후 11시 자동 실행:
-  트렌드 수집 + AI 스크립트 생성 → Notion 에 날짜 제목 페이지로 아카이븍
+매일 오후 11시 — 오늘의 트렌드/스크립트/트윗 결과를 Notion에 자동 아카이빙
+
+페이지 구조:
+  TwiterTrend (부모 페이지)
+  └── 2025-03-30           ← 날짜 제목으로 매일 새 페이지 생성
+      ├── 📊 오늘의 트렌드
+      │   ├── 타임라인 Top 3
+      │   └── 대한민국 트렌딩 Top 3
+      ├── 📝 선택된 주제 & 스크립트
+      │   ├── hook / body / closer
+      │   └── 키워드 / 분위기
+      ├── 🐦 트윗 초안
+      │   ├── 정보형
+      │   ├── 공감형
+      │   └── 해시태그형
+      └── 🎬 쇼츠 영상
+          └── YouTube 링크 (업로드된 경우)
+
+필요:
+  NOTION_TOKEN    — Notion Integration Token
+  NOTION_PARENT_PAGE_ID — 부모 페이지 ID (TwiterTrend)
+
+설치:
+  pip install notion-client
 
 사용법:
-  python notion_archiver.py              — 즉시 실행 (오늘 날짜 페이지 생성)
-  python notion_archiver.py --date 2025-03-30  — 특정 날짜로 생성
+  # 직접 실행 (테스트)
+  python notion_archiver.py --test
 
-필요 환경변수:
-  NOTION_TOKEN          — Notion Integration 토큰 (https://www.notion.so/my-integrations)
-  NOTION_PARENT_PAGE_ID — 상위 페이지 ID (TwiterTrend 페이지 ID)
-  ANTHROPIC_API_KEY     — 스크립트 생성
-  TWITTER_BEARER_TOKEN  — 트렌드 수집
+  # 파이프라인에서 자동 호출
+  from notion_archiver import archive_daily
+  archive_daily(trends, topic, script, tweet_drafts, youtube_url)
 """
-import argparse
 import os
-import sys
-from datetime import date, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-import requests
+from notion_client import Client
 
-# 파이프라인 모듈 로드 (pipeline.py 와 같은 디렉토리에 있어야 함)
-sys.path.insert(0, str(Path(__file__).parent))
-
-
-# ═══════════════════════════════════════════════════════════
-# 메인
-# ═══════════════════════════════════════════════════════════
-
-def main():
-    parser = argparse.ArgumentParser(description="Notion 일일 트렌드 아카이브")
-    parser.add_argument("--date", type=str, default="",
-                        help="아카이브 날짜 (YYYY-MM-DD, 기본: 오늘)")
-    args = parser.parse_args()
-
-    target_date = args.date or date.today().strftime("%Y-%m-%d")
-    print(f"\n🗓️  Notion 아카이브 시작 — {target_date}")
-
-    # 환경변수 확인
-    notion_token = os.environ.get("NOTION_TOKEN", "")
-    parent_id    = os.environ.get("NOTION_PARENT_PAGE_ID", "3336d03aed9180e482a4cb1c02f0d9e1")
-
-    if not notion_token:
-        print("⚠️  NOTION_TOKEN 환경변수가 없습니다.")
-        print("   https://www.notion.so/my-integrations 에서 토큰을 발급하세요.")
-        sys.exit(1)
-
-    # 트렌드 수집
-    print("\n[1/3] 트렌드 수집 중...")
-    trends    = _fetch_trends_safe()
-    timeline  = trends.get("timeline", [])
-    trending  = trends.get("trending", [])
-
-    # 스크립트 생성 (킸 주제 선택)
-    print("\n[2/3] AI 스크립트 생성 중...")
-    top_topic  = (timeline + trending)[0]["topic"] if (timeline or trending) else ""
-    script     = _generate_script_safe(top_topic)
-
-    # Notion 페이지 생성
-    print("\n[3/3] Notion 페이지 생성 중...")
-    page_url = create_daily_page(
-        notion_token=notion_token,
-        parent_id=parent_id,
-        target_date=target_date,
-        timeline=timeline,
-        trending=trending,
-        script=script,
-        top_topic=top_topic,
-    )
-    print(f"\n✅ 아카이브 완료 → {page_url}")
+PARENT_PAGE_ID = os.environ.get(
+    "NOTION_PARENT_PAGE_ID", "3336d03a-ed91-80e4-82a4-cb1c02f0d9e1"
+)
 
 
-# ═══════════════════════════════════════════════════════════
-# Notion 페이지 생성
-# ═══════════════════════════════════════════════════════════
+# ─── 공개 API ────────────────────────────────────────────────
 
-def create_daily_page(
-    notion_token: str,
-    parent_id: str,
-    target_date: str,
-    timeline: list,
-    trending: list,
-    script: dict,
-    top_topic: str,
+def archive_daily(
+    trends: dict | None = None,
+    topic: str = "",
+    script: dict | None = None,
+    tweet_drafts: dict | None = None,
+    youtube_url: str = "",
+    video_path: str = "",
 ) -> str:
     """
-    Notion에 날짜 제목 페이지 생성.
-    반환: 생성된 페이지 URL
+    오늘 날짜 Notion 페이지 생성 후 데이터 채우기.
+
+    반환: 생성된 Notion 페이지 URL
     """
-    headers = {
-        "Authorization":  f"Bearer {notion_token}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type":   "application/json",
-    }
+    token = os.environ.get("NOTION_TOKEN", "")
+    if not token:
+        raise ValueError(
+            "NOTION_TOKEN 환경변수가 없습니다.\n"
+            "Notion Integration Token을 설정해주세요.\n"
+            "발급: https://www.notion.so/profile/integrations"
+        )
 
-    # 페이지 제목 (YYYY-MM-DD 요일)
-    dt       = datetime.strptime(target_date, "%Y-%m-%d")
-    weekdays = ["(Mon)", "(Tue)", "(Wed)", "(Thu)", "(Fri)", "(Sat)", "(Sun)"]
-    title    = f"{target_date} {weekdays[dt.weekday()]}"
+    notion = Client(auth=token)
+    today  = datetime.now().strftime("%Y-%m-%d")
+    weekday = _weekday_ko()
 
-    # 페이지 콘텐츠 블록 조립
-    children = [
-        # 타임라인 트렌드
-        _heading2("🐦  내 팔로워 타임라인 Top 3"),
-    ]
-    if timeline:
-        for t in timeline:
-            children.append(_bullet(
-                f"{t['rank']}. {t['topic']}  —  RT {t.get('rt_count', 0):,}  |"
-                f"  트윗 {t.get('tweet_count', 0)}개"
-            ))
-    else:
-        children.append(_bullet("(데이터 없음)"))
+    print(f"  → Notion 페이지 생성 중: {today}...")
 
-    children.append(_heading2("📈  대한민국 트렌딩 Top 3"))
-    if trending:
-        for t in trending:
-            vol = f"{t.get('tweet_volume', 0):,}" if t.get("tweet_volume") else "—"
-            children.append(_bullet(f"{t['rank']}. {t['topic']}  —  트윗 {vol}"))
-    else:
-        children.append(_bullet("(데이터 없음)"))
-
-    # 주제 & 스크립트
-    children.append(_heading2("📝  오늘의 주제 & 스크립트"))
-    if top_topic:
-        children.append(_paragraph(f"🎯 주제: {top_topic}"))
-    if script:
-        children.append(_paragraph(f"🎣 Hook: {script.get('hook', '')}"))
-        body = script.get("body", [])
-        for i, b in enumerate(body, 1):
-            children.append(_bullet(f"Body {i}: {b}"))
-        children.append(_paragraph(f"💬 Closer: {script.get('closer', '')}"))
-        kws = ", ".join(f"#{k}" for k in script.get("keywords", []))
-        if kws:
-            children.append(_paragraph(f"🏷️ {kws}"))
-    else:
-        children.append(_paragraph("(스크립트 없음)"))
-
-    # 쇼츠/트윗 결과 섹션 (파이프라인 실행 후 나중에 채울 수 있도록)
-    children.append(_heading2("🎬  오늘의 쇼츠"))
-    children.append(_paragraph("(파이프라인 실행 후 YouTube URL이 여기에 기록됩니다)"))
-
-    children.append(_heading2("🐦  오늘의 트윗"))
-    children.append(_paragraph("(파이프라인 실행 후 게시된 트윗 URL이 여기에 기록됩니다)"))
-
-    # Notion API 호출
-    payload = {
-        "parent": {"type": "page_id", "page_id": parent_id},
-        "properties": {
-            "title": {"title": [{"type": "text", "text": {"content": title}}]}
+    # 1. 날짜 제목으로 새 페이지 생성
+    page = notion.pages.create(
+        parent={"page_id": PARENT_PAGE_ID},
+        properties={
+            "title": {
+                "title": [{"type": "text", "text": {"content": f"{today} ({weekday})"}}]
+            }
         },
-        "children": children,
-    }
-
-    resp = requests.post(
-        "https://api.notion.com/v1/pages",
-        headers=headers,
-        json=payload,
-        timeout=15,
+        icon={"type": "emoji", "emoji": "📅"},
     )
-
-    if resp.status_code != 200:
-        raise RuntimeError(f"Notion 페이지 생성 실패: {resp.status_code} {resp.text[:200]}")
-
-    page_id  = resp.json()["id"]
+    page_id  = page["id"]
     page_url = f"https://www.notion.so/{page_id.replace('-', '')}"
+
+    # 2. 콘텐츠 블록 추가
+    blocks = []
+
+    # 트렌드 섹션
+    blocks += _build_trends_section(trends)
+
+    # 주제 & 스크립트 섹션
+    if topic or script:
+        blocks += _build_script_section(topic, script)
+
+    # 트윗 초안 섹션
+    if tweet_drafts:
+        blocks += _build_tweet_section(tweet_drafts)
+
+    # 쇼츠 영상 섹션
+    blocks += _build_video_section(youtube_url, video_path)
+
+    # 블록 추가 (한 번에 최대 100개)
+    for i in range(0, len(blocks), 100):
+        notion.blocks.children.append(
+            block_id=page_id,
+            children=blocks[i:i+100],
+        )
+
+    print(f"  ✓ Notion 아카이빙 완료: {page_url}")
     return page_url
 
 
-def append_to_daily_page(
-    notion_token: str,
-    page_id: str,
-    section: str,
-    content: str,
-):
-    """
-    이미 생성된 날짜 페이지에 크영 또는 ?어 URL 추가.
-    pipeline.py 이 upload 후에 호출.
+# ─── 섹션 빌더 ───────────────────────────────────────────────
 
-    Args:
-        page_id:  날짜 페이지 ID
-        section:  'youtube' 또는 'tweet'
-        content:  추가할 URL 또는 텍스트
-    """
-    headers = {
-        "Authorization":  f"Bearer {notion_token}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type":   "application/json",
-    }
-    emoji = "🎬" if section == "youtube" else "🐦"
-    block = {
-        "children": [
-            _paragraph(f"{emoji} {content}")
-        ]
-    }
-    resp = requests.patch(
-        f"https://api.notion.com/v1/blocks/{page_id}/children",
-        headers=headers,
-        json=block,
-        timeout=10,
-    )
-    return resp.status_code == 200
+def _build_trends_section(trends: dict | None) -> list:
+    blocks = [
+        _heading2("📊 오늘의 트렌드"),
+    ]
+
+    if not trends:
+        blocks.append(_paragraph("트렌드 데이터 없음"))
+        return blocks
+
+    tl  = trends.get("timeline", [])
+    ktr = trends.get("trending", [])
+
+    if tl:
+        blocks.append(_heading3("🐦 타임라인 Top 3"))
+        for t in tl:
+            rt  = f"{t.get('rt_count', 0):,}"
+            cnt = t.get("tweet_count", 0)
+            blocks.append(_bullet(f"{t['rank']}. {t['topic']}  —  RT {rt} | 트윗 {cnt}개"))
+
+    if ktr:
+        blocks.append(_heading3("📈 대한민국 트렌딩 Top 3"))
+        for t in ktr:
+            vol = f"{t.get('tweet_volume', 0):,}" if t.get("tweet_volume") else "—"
+            blocks.append(_bullet(f"{t['rank']}. {t['topic']}  —  트윗 {vol}"))
+
+    return blocks
 
 
-# ═══════════════════════════════════════════════════════════
-# 블록 헬퍼
-# ═══════════════════════════════════════════════════════════
+def _build_script_section(topic: str, script: dict | None) -> list:
+    blocks = [_heading2("📝 선택된 주제 & 스크립트")]
+
+    if topic:
+        blocks.append(_paragraph(f"주제: {topic}"))
+
+    if not script:
+        return blocks
+
+    blocks.append(_heading3("스크립트"))
+    blocks.append(_bullet(f"Hook: {script.get('hook', '')}"))
+
+    for i, b in enumerate(script.get("body", []), 1):
+        blocks.append(_bullet(f"Body {i}: {b}"))
+
+    blocks.append(_bullet(f"Closer: {script.get('closer', '')}"))
+    blocks.append(_paragraph(
+        f"키워드: {', '.join(script.get('keywords', []))}  |  분위기: {script.get('mood', '')}"
+    ))
+
+    return blocks
+
+
+def _build_tweet_section(tweet_drafts: dict) -> list:
+    blocks = [_heading2("🐦 트윗 초안")]
+
+    labels = {"info": "정보형", "emotion": "공감형", "hashtag": "해시태그형"}
+    for key, label in labels.items():
+        text = tweet_drafts.get(key, "")
+        if text:
+            blocks.append(_heading3(label))
+            blocks.append(_paragraph(text))
+
+    return blocks
+
+
+def _build_video_section(youtube_url: str, video_path: str) -> list:
+    blocks = [_heading2("🎬 쇼츠 영상")]
+
+    if youtube_url:
+        blocks.append(_paragraph(f"YouTube: {youtube_url}"))
+    elif video_path:
+        blocks.append(_paragraph(f"로컬 파일: {video_path}"))
+    else:
+        blocks.append(_paragraph("영상 없음 (트윗만 생성된 경우)"))
+
+    return blocks
+
+
+# ─── 블록 헬퍼 ───────────────────────────────────────────────
 
 def _heading2(text: str) -> dict:
-    return {"object": "block", "type": "heading_2",
-            "heading_2": {"rich_text": [{"type": "text", "text": {"content": text}}]}}
+    return {
+        "object": "block",
+        "type": "heading_2",
+        "heading_2": {"rich_text": [{"type": "text", "text": {"content": text}}]},
+    }
+
+
+def _heading3(text: str) -> dict:
+    return {
+        "object": "block",
+        "type": "heading_3",
+        "heading_3": {"rich_text": [{"type": "text", "text": {"content": text}}]},
+    }
+
 
 def _paragraph(text: str) -> dict:
-    return {"object": "block", "type": "paragraph",
-            "paragraph": {"rich_text": [{"type": "text", "text": {"content": text}}]}}
+    return {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {"rich_text": [{"type": "text", "text": {"content": text}}]},
+    }
+
 
 def _bullet(text: str) -> dict:
-    return {"object": "block", "type": "bulleted_list_item",
-            "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": text}}]}}
+    return {
+        "object": "block",
+        "type": "bulleted_list_item",
+        "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": text}}]},
+    }
 
 
-# ═══════════════════════════════════════════════════════════
-# 파이프라인 연동 헬퍼
-# ═══════════════════════════════════════════════════════════
+# ─── 유틸 ────────────────────────────────────────────────────
 
-def _fetch_trends_safe() -> dict:
-    """Bearer Token 없으면 빈 dict 반환."""
-    try:
-        from twitter_fetcher import fetch_trends
-        return fetch_trends()
-    except Exception as e:
-        print(f"  ⚠️  트렌드 수집 실패: {e}")
-        return {"timeline": [], "trending": []}
+def _weekday_ko() -> str:
+    days = ["월", "화", "수", "목", "금", "토", "일"]
+    return days[datetime.now().weekday()]
 
 
-def _generate_script_safe(topic: str) -> dict:
-    """API 키 없으면 빈 dict 반환."""
-    if not topic:
-        return {}
-    try:
-        from content_fetcher import fetch_topic_context
-        from script_generator import generate_rich_script
-        news_ctx = fetch_topic_context(topic)
-        return generate_rich_script(topic=topic, context={"news": news_ctx})
-    except Exception as e:
-        print(f"  ⚠️  스크립트 생성 실패: {e}")
-        return {}
-
+# ─── CLI 테스트 ───────────────────────────────────────────────
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Notion 아카이빙 테스트")
+    parser.add_argument("--test", action="store_true", help="더미 데이터로 테스트 실행")
+    args = parser.parse_args()
+
+    if args.test:
+        dummy_trends = {
+            "timeline": [
+                {"rank": 1, "topic": "서인영 유튜브 복귀", "rt_count": 4200, "tweet_count": 12},
+                {"rank": 2, "topic": "갤럭시 S25 언팩",   "rt_count": 3800, "tweet_count": 8},
+                {"rank": 3, "topic": "손흥민 해트트릭",   "rt_count": 3100, "tweet_count": 15},
+            ],
+            "trending": [
+                {"rank": 1, "topic": "이재명 판결",    "tweet_volume": 85000},
+                {"rank": 2, "topic": "설 연휴 기차표", "tweet_volume": 62000},
+                {"rank": 3, "topic": "AI 일자리 대체", "tweet_volume": 41000},
+            ],
+        }
+        dummy_script = {
+            "hook":     "서인영이 돌아왔다. 그것도 유튜브로.",
+            "body":     ["10년 공백을 깨고 첫 영상 100만뷰", "팬들 반응 둘로 갈렸다"],
+            "closer":   "여러분은 어떻게 생각하세요?",
+            "keywords": ["서인영", "유튜브복귀", "레전드"],
+            "mood":     "dramatic",
+        }
+        dummy_tweets = {
+            "info":    "서인영 유튜브 복귀, 첫 영상 100만뷰 돌파. 역시 레전드.",
+            "emotion": "서인영 언니 돌아왔다!! 진짜 기다렸어 🔥",
+            "hashtag": "서인영이 돌아왔다 #서인영 #유튜브복귀 #레전드",
+        }
+
+        url = archive_daily(
+            trends=dummy_trends,
+            topic="서인영 유튜브 복귀",
+            script=dummy_script,
+            tweet_drafts=dummy_tweets,
+            youtube_url="",
+        )
+        print(f"\n✅ 테스트 완료: {url}")
+    else:
+        print("--test 옵션으로 실행하세요.")
