@@ -1,1 +1,353 @@
-"""\npipeline.py\n트위터 트렌드 수집 → 주제 선택 → 트윗/쇼츠 제작 → 최종 확인 → 업로드\n\n실행:\n  python pipeline.py\n  python pipeline.py --url \"https://x.com/...\"\n  python pipeline.py --topic \"주제 직접 입력\"\n\n환경변수 (필수):\n  ANTHROPIC_API_KEY\n  TWITTER_BEARER_TOKEN\n\n환경변수 (선택):\n  TWITTER_API_KEY / SECRET / ACCESS_TOKEN / ACCESS_SECRET  → 트윗 게시\n  NAVER_CLIENT_ID / NAVER_CLIENT_SECRET                    → 네이버 뉴스 검색\n  BING_IMAGE_KEY                                           → 이미지 자동 수집\n  BING_SEARCH_KEY                                          → Bing 웹 검색\n  PEXELS_API_KEY                                           → 영상/이미지 폴백\n  YOUTUBE_CLIENT_SECRETS                                   → 쇼츠 업로드\n"""\nimport os\nimport sys\nfrom pathlib import Path\n\nfrom content_fetcher import fetch_content, fetch_topic_context\nfrom image_fetcher import fetch_image\nfrom script_generator import generate_script, generate_rich_script\nfrom tts_generator import generate_tts\nfrom twitter_fetcher import fetch_trends, fetch_tweet_context\nfrom twitter_poster import generate_tweet_drafts, post_tweet\nfrom video_assembler import assemble_video\nfrom youtube_uploader import upload_shorts\n\nOUTPUT_DIR = Path(\"output\")\n\n\n# ─── 메인 파이프라인 ─────────────────────────────────────────\n\ndef run():\n    import argparse\n    parser = argparse.ArgumentParser(description=\"Shorts & Tweet 자동화 파이프라인\")\n    parser.add_argument(\"--url\",   type=str, default=\"\", help=\"X(트위터) URL 직접 입력\")\n    parser.add_argument(\"--topic\", type=str, default=\"\", help=\"주제 직접 입력\")\n    args = parser.parse_args()\n\n    OUTPUT_DIR.mkdir(exist_ok=True)\n    _print_banner()\n\n    # ── STEP 1: 입력 방식 분기 ───────────────────────────────\n    if args.url:\n        print(\"\\n\" + \"─\" * 52)\n        print(\" [1/6] X URL 컨텍스트 수집 중...\")\n        print(\"─\" * 52)\n        try:\n            context = fetch_tweet_context(args.url)\n            topic   = context[\"summary\"][\"topic\"]\n            content = {\n                \"title\": topic,\n                \"text\": context[\"summary\"][\"combined_text\"],\n                \"source\": args.url,\n                \"twitter_context\": context,\n            }\n        except Exception as e:\n            _err(str(e))\n            sys.exit(1)\n\n    elif args.topic:\n        topic   = args.topic\n        content = {\"title\": topic, \"text\": topic, \"source\": \"direct\"}\n        print(f\"\\n  → 주제: {topic}\")\n\n    else:\n        trends  = _step_collect_trends()\n        topic   = _step_pick_topic(trends)\n        content = {\"title\": topic, \"text\": topic, \"source\": \"trend\"}\n\n    # ── STEP 2: 제작 방식 선택 ───────────────────────────────\n    action = _step_pick_action()\n\n    # ── STEP 3: AI 생성 ──────────────────────────────────────\n    script, tweet_drafts, image_path, tts_path, video_path = \\\n        _step_generate(topic, action, content)\n\n    # ── STEP 4: 최종 확인 + 수정 루프 ────────────────────────\n    script, tweet_drafts, chosen_tweet = \\\n        _step_review(topic, action, script, tweet_drafts, image_path)\n\n    # ── STEP 5: 업로드 ───────────────────────────────────────\n    _step_upload(action, chosen_tweet, video_path, topic, script)\n\n\n# ─── STEP 1: 트렌드 수집 ─────────────────────────────────────\n\ndef _step_collect_trends() -> dict:\n    print(\"\\n\" + \"─\" * 52)\n    print(\" [1/6] 트렌드 수집 중...\")\n    print(\"─\" * 52)\n\n    while True:\n        try:\n            trends = fetch_trends()\n            _print_trends(trends)\n            return trends\n        except ValueError as e:\n            _err(str(e))\n            sys.exit(1)\n        except Exception as e:\n            _err(f\"수집 실패: {e}\")\n            if _ask(\"다시 시도할까요? (y/n): \") == \"y\":\n                continue\n            sys.exit(1)\n\n\ndef _print_trends(trends: dict):\n    tl  = trends.get(\"timeline\", [])\n    ktr = trends.get(\"trending\", [])\n\n    print(\"\\n  [ 내 팔로워 타임라인 Top 3 ]\")\n    if tl:\n        for t in tl:\n            print(f\"   {t['rank']}. {t['topic']:<28}  RT {t['rt_count']:,}\")\n    else:\n        print(\"   (타임라인 데이터 없음)\")\n\n    print(\"\\n  [ 대한민국 전체 트렌딩 Top 3 ]\")\n    if ktr:\n        for t in ktr:\n            vol = f\"{t['tweet_volume']:,}\" if t.get(\"tweet_volume\") else \"—\"\n            print(f\"   {t['rank'] + len(tl)}. {t['topic']:<28}  트윗 {vol}\")\n    else:\n        print(\"   (트렌딩 데이터 없음)\")\n\n\n# ─── STEP 2: 주제 선택 ───────────────────────────────────────\n\ndef _step_pick_topic(trends: dict) -> str:\n    tl  = trends.get(\"timeline\", [])\n    ktr = trends.get(\"trending\", [])\n    all_topics = [t[\"topic\"] for t in tl] + [t[\"topic\"] for t in ktr]\n\n    print(\"\\n\" + \"─\" * 52)\n    print(\" [2/6] 주제를 선택하세요\")\n    print(\"─\" * 52)\n    print(\"  번호 입력 → 해당 주제 선택\")\n    print(\"  d         → 직접 입력\")\n    print(\"  r         → 트렌드 다시 수집\")\n    print()\n\n    while True:\n        raw = _ask(\"  선택: \").strip().lower()\n        if raw == \"r\":\n            return _step_pick_topic(_step_collect_trends())\n        if raw == \"d\":\n            topic = _ask(\"  주제 직접 입력: \").strip()\n            if topic:\n                print(f\"\\n  ✓ 선택된 주제: {topic}\")\n                return topic\n            continue\n        try:\n            idx = int(raw) - 1\n            if 0 <= idx < len(all_topics):\n                topic = all_topics[idx]\n                print(f\"\\n  ✓ 선택된 주제: {topic}\")\n                return topic\n        except ValueError:\n            pass\n        print(\"  올바른 번호 또는 d/r을 입력하세요.\")\n\n\n# ─── STEP 3: 제작 방식 선택 ──────────────────────────────────\n\ndef _step_pick_action() -> str:\n    print(\"\\n\" + \"─\" * 52)\n    print(\" [3/6] 무엇을 만들까요?\")\n    print(\"─\" * 52)\n    print(\"  1. 트윗만 작성\")\n    print(\"  2. 쇼츠만 제작\")\n    print(\"  3. 트윗 + 쇼츠 둘 다\")\n    print()\n    while True:\n        raw = _ask(\"  선택 (1/2/3): \").strip()\n        if raw == \"1\": return \"tweet\"\n        if raw == \"2\": return \"shorts\"\n        if raw == \"3\": return \"both\"\n        print(\"  1, 2, 3 중 하나를 입력하세요.\")\n\n\n# ─── STEP 4: AI 생성 ─────────────────────────────────────────\n\ndef _step_generate(topic: str, action: str, content: dict | None = None):\n    print(\"\\n\" + \"─\" * 52)\n    print(\" [4/6] AI 콘텐츠 생성 중...\")\n    print(\"─\" * 52)\n\n    if content is None:\n        content = {\"title\": topic, \"text\": topic, \"source\": \"direct\"}\n\n    # 트위터 컨텍스트 (URL 모드에서 넘어온 경우 또는 관련 트윗 수집)\n    twitter_ctx = content.get(\"twitter_context\")\n    if not twitter_ctx:\n        try:\n            print(\"  → 트위터 관련 트윗 수집 중...\")\n            from twitter_fetcher import _fetch_related_tweets, _extract_keywords, _headers\n            h  = _headers()\n            kw = _extract_keywords(topic)\n            related = _fetch_related_tweets(kw, \"\", h, max_results=10)\n            if related:\n                twitter_ctx = {\n                    \"quote_tweets\": [],\n                    \"related\": related,\n                    \"summary\": {\n                        \"sentiment_hint\": \"\",\n                        \"combined_text\": \"\\n\".join(f\"- {t['text']}\" for t in related[:5]),\n                    },\n                }\n        except Exception as e:\n            print(f\"  ⚠️  트위터 수집 생략: {e}\")\n\n    # 뉴스/웹 검색\n    print(\"  → 뉴스/웹 검색 중...\")\n    news_ctx = fetch_topic_context(topic)\n    sources  = news_ctx.get(\"sources_used\", [])\n\n    # 스크립트 생성\n    print(\"  → 스크립트 생성 중...\")\n    if twitter_ctx or news_ctx.get(\"news\") or news_ctx.get(\"web\"):\n        script = generate_rich_script(\n            topic=topic,\n            context={\"twitter\": twitter_ctx, \"news\": news_ctx},\n        )\n        print(f\"  → 종합 스크립트 완료 (소스: {', '.join(sources) if sources else '트위터만'})\")\n    else:\n        script = generate_script(content)\n\n    # 트윗 초안\n    tweet_drafts = None\n    if action in (\"tweet\", \"both\"):\n        print(\"  → 트윗 초안 생성 중...\")\n        tweet_drafts = generate_tweet_drafts(topic, script)\n\n    # 쇼츠 제작\n    image_path = tts_path = video_path = None\n    if action in (\"shorts\", \"both\"):\n        print(\"  → 이미지 수집 중...\")\n        image_path = fetch_image(\n            keywords=script.get(\"keywords\", []),\n            output_dir=OUTPUT_DIR,\n            pexels_key=os.environ.get(\"PEXELS_API_KEY\", \"\"),\n        )\n        print(\"  → TTS 음성 생성 중...\")\n        tts_path = generate_tts(script, OUTPUT_DIR)\n        print(\"  → 영상 조립 중...\")\n        video_path = assemble_video(\n            script=script,\n            tts_path=tts_path,\n            output_path=OUTPUT_DIR / \"shorts.mp4\",\n            image_path=image_path,\n            pexels_key=os.environ.get(\"PEXELS_API_KEY\", \"\"),\n        )\n\n    print(\"  ✓ 생성 완료!\")\n    return script, tweet_drafts, image_path, tts_path, video_path\n\n\n# ─── STEP 5: 최종 확인 + 수정 루프 ──────────────────────────\n\ndef _step_review(topic, action, script, tweet_drafts, image_path):\n    chosen_tweet = None\n    while True:\n        print(\"\\n\" + \"─\" * 52)\n        print(\" [5/6] 최종 확인\")\n        print(\"─\" * 52)\n        print(\"\\n  [ 쇼츠 스크립트 ]\")\n        print(f\"  Hook  : {script['hook']}\")\n        for i, b in enumerate(script.get('body', []), 1):\n            print(f\"  Body {i}: {b}\")\n        print(f\"  Closer: {script['closer']}\")\n        if tweet_drafts:\n            print(\"\\n  [ 트윗 초안 ]\")\n            for num, label, key in [(\"1\",\"정보형\",\"info\"),(\"2\",\"공감형\",\"emotion\"),(\"3\",\"해시태그형\",\"hashtag\")]:\n                text = tweet_drafts.get(key, \"\")\n                print(f\"  [{num}] {label}  ({len(text)}자)\")\n                print(f\"      {text}\")\n        if action in (\"shorts\", \"both\"):\n            mp4 = OUTPUT_DIR / \"shorts.mp4\"\n            print(f\"\\n  [ 쇼츠 영상 ] {mp4} ({'존재' if mp4.exists() else '없음'})\")\n        print(\"\\n  ─────────────────────────────────\")\n        if tweet_drafts:\n            print(\"  tw1 / tw2 / tw3  — 트윗 버전 선택\")\n        print(\"  s:내용   — 스크립트 재생성  (예: s:더 강렬하게)\")\n        print(\"  t:내용   — 트윗 재생성      (예: t:더 재미있게)\")\n        print(\"  ok       — 업로드 진행\")\n        print(\"  q        — 종료\")\n        print()\n        raw = _ask(\"  입력: \").strip().lower()\n        if raw == \"ok\":\n            if tweet_drafts and chosen_tweet is None:\n                chosen_tweet = tweet_drafts.get(\"emotion\", \"\")\n                print(\"  (트윗 버전 미선택 → 공감형 자동 선택)\")\n            break\n        elif raw == \"q\":\n            print(\"  종료합니다.\")\n            sys.exit(0)\n        elif tweet_drafts and raw in (\"tw1\", \"tw2\", \"tw3\"):\n            key = {\"tw1\": \"info\", \"tw2\": \"emotion\", \"tw3\": \"hashtag\"}[raw]\n            chosen_tweet = tweet_drafts[key]\n            print(f\"  ✓ 트윗 선택: {chosen_tweet}\")\n        elif raw.startswith(\"s:\"):\n            inst = raw[2:].strip()\n            print(f\"  → 스크립트 재생성 중 ({inst})...\")\n            c = {\"title\": topic, \"text\": f\"{topic}. {inst}\", \"source\": \"direct\"}\n            script = generate_script(c)\n            if tweet_drafts:\n                tweet_drafts = generate_tweet_drafts(topic, script)\n            print(\"  ✓ 재생성 완료\")\n        elif raw.startswith(\"t:\"):\n            if not tweet_drafts:\n                print(\"  트윗 모드가 아닙니다.\")\n                continue\n            inst = raw[2:].strip()\n            print(f\"  → 트윗 재생성 중 ({inst})...\")\n            ms = dict(script)\n            ms[\"hook\"] = f\"{script['hook']} ({inst})\"\n            tweet_drafts = generate_tweet_drafts(topic, ms)\n            print(\"  ✓ 재생성 완료\")\n        else:\n            print(\"  올바른 명령을 입력하세요.\")\n    return script, tweet_drafts, chosen_tweet\n\n\n# ─── STEP 6: 업로드 ──────────────────────────────────────────\n\ndef _step_upload(action: str, chosen_tweet, video_path, topic: str, script: dict = None):\n    print(\"\\n\" + \"─\" * 52)\n    print(\" [6/6] 업로드\")\n    print(\"─\" * 52)\n    if action in (\"tweet\", \"both\") and chosen_tweet:\n        print(f\"\\n  트윗 게시 예정:\\n  {chosen_tweet}\\n\")\n        if _ask(\"  트윗 게시할까요? (y/n): \").strip().lower() == \"y\":\n            try:\n                result = post_tweet(chosen_tweet)\n                print(f\"  ✓ 트윗 게시 완료: {result['url']}\")\n            except Exception as e:\n                _err(f\"트윗 게시 실패: {e}\")\n        else:\n            print(\"  트윗 게시 건너뜀.\")\n    if action in (\"shorts\", \"both\") and video_path and video_path.exists():\n        print(f\"\\n  쇼츠 파일: {video_path}\")\n        secrets = Path(os.environ.get(\"YOUTUBE_CLIENT_SECRETS\", \"config/client_secrets.json\"))\n        if not secrets.exists():\n            print(\"  ℹ️  client_secrets.json 없음 → 로컬 저장만\")\n            print(f\"  ✓ 쇼츠 저장 완료: {video_path.resolve()}\")\n        else:\n            if _ask(\"  YouTube에 업로드할까요? (y/n): \").strip().lower() == \"y\":\n                privacy = _ask(\"  공개 범위 (public/unlisted/private) [기본: public]: \").strip()\n                if privacy not in (\"public\", \"unlisted\", \"private\"):\n                    privacy = \"public\"\n                try:\n                    result = upload_shorts(\n                        video_path=video_path,\n                        title=topic,\n                        tags=(script or {}).get(\"keywords\", []),\n                        privacy=privacy,\n                    )\n                    print(f\"  ✓ YouTube 업로드 완료: {result['url']}\")\n                except Exception as e:\n                    _err(f\"YouTube 업로드 실패: {e}\")\n                    print(f\"  파일은 로컬에 저장됨: {video_path.resolve()}\")\n            else:\n                print(f\"  업로드 건너뜀. 파일: {video_path.resolve()}\")\n    print(\"\\n  ✅ 파이프라인 완료!\")\n\n\n# ─── 유틸 ────────────────────────────────────────────────────\n\ndef _ask(prompt: str) -> str:\n    try:\n        return input(prompt)\n    except (EOFError, KeyboardInterrupt):\n        print(\"\\n  중단됨.\")\n        sys.exit(0)\n\ndef _err(msg: str):\n    print(f\"\\n  ⚠️  {msg}\")\n\ndef _print_banner():\n    print(\"\\n\" + \"=\" * 52)\n    print(\"  Shorts & Tweet 자동화 파이프라인\")\n    print(\"=\" * 52)\n\nif __name__ == \"__main__\":\n    run()\n
+"""
+pipeline.py
+트위터 트렌드 수집 → 주제 선택 → 트윗/쇼츠 제작 → 최종 확인 → 업로드
+
+실행:
+  python pipeline.py
+  python pipeline.py --url "https://x.com/..."
+  python pipeline.py --topic "주제 직접 입력"
+"""
+import os
+import sys
+from pathlib import Path
+
+from content_fetcher import fetch_content, fetch_topic_context
+from image_fetcher import fetch_image
+from script_generator import generate_script, generate_rich_script
+from tts_generator import generate_tts
+from twitter_fetcher import fetch_trends, fetch_tweet_context
+from twitter_poster import generate_tweet_drafts, post_tweet
+from video_assembler import assemble_video
+from youtube_uploader import upload_shorts
+
+OUTPUT_DIR = Path("output")
+
+
+def run():
+    import argparse
+    parser = argparse.ArgumentParser(description="Shorts & Tweet 자동화 파이프라인")
+    parser.add_argument("--url",   type=str, default="", help="X(트위터) URL 직접 입력")
+    parser.add_argument("--topic", type=str, default="", help="주제 직접 입력")
+    args = parser.parse_args()
+
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    _print_banner()
+
+    if args.url:
+        print("\n" + "─" * 52)
+        print(" [1/6] X URL 컨텍스트 수집 중...")
+        print("─" * 52)
+        try:
+            context = fetch_tweet_context(args.url)
+            topic   = context["summary"]["topic"]
+            content = {
+                "title": topic,
+                "text":  context["summary"]["combined_text"],
+                "source": args.url,
+                "twitter_context": context,
+            }
+        except Exception as e:
+            _err(str(e))
+            sys.exit(1)
+
+    elif args.topic:
+        topic   = args.topic
+        content = {"title": topic, "text": topic, "source": "direct"}
+        print(f"\n  → 주제: {topic}")
+
+    else:
+        trends  = _step_collect_trends()
+        topic   = _step_pick_topic(trends)
+        content = {"title": topic, "text": topic, "source": "trend"}
+
+    action = _step_pick_action()
+
+    script, tweet_drafts, image_path, tts_path, video_path = \
+        _step_generate(topic, action, content)
+
+    script, tweet_drafts, chosen_tweet = \
+        _step_review(topic, action, script, tweet_drafts, image_path)
+
+    _step_upload(action, chosen_tweet, video_path, topic, script)
+
+
+def _step_collect_trends() -> dict:
+    print("\n" + "─" * 52)
+    print(" [1/6] 트렌드 수집 중...")
+    print("─" * 52)
+    while True:
+        try:
+            trends = fetch_trends()
+            _print_trends(trends)
+            return trends
+        except ValueError as e:
+            _err(str(e))
+            sys.exit(1)
+        except Exception as e:
+            _err(f"수집 실패: {e}")
+            if _ask("다시 시도할까요? (y/n): ") == "y":
+                continue
+            sys.exit(1)
+
+
+def _print_trends(trends: dict):
+    tl  = trends.get("timeline", [])
+    ktr = trends.get("trending", [])
+    print("\n  [ 내 팔로워 타임라인 Top 3 ]")
+    if tl:
+        for t in tl:
+            print(f"   {t['rank']}. {t['topic']:<28}  RT {t['rt_count']:,}")
+    else:
+        print("   (타임라인 데이터 없음)")
+    print("\n  [ 대한민국 전체 트렌딩 Top 3 ]")
+    if ktr:
+        for t in ktr:
+            vol = f"{t['tweet_volume']:,}" if t.get("tweet_volume") else "—"
+            print(f"   {t['rank'] + len(tl)}. {t['topic']:<28}  트윗 {vol}")
+    else:
+        print("   (트렌딩 데이터 없음)")
+
+
+def _step_pick_topic(trends: dict) -> str:
+    tl  = trends.get("timeline", [])
+    ktr = trends.get("trending", [])
+    all_topics = [t["topic"] for t in tl] + [t["topic"] for t in ktr]
+    print("\n" + "─" * 52)
+    print(" [2/6] 주제를 선택하세요")
+    print("─" * 52)
+    print("  번호 입력 → 해당 주제 선택")
+    print("  d         → 직접 입력")
+    print("  r         → 트렌드 다시 수집")
+    print()
+    while True:
+        raw = _ask("  선택: ").strip().lower()
+        if raw == "r":
+            return _step_pick_topic(_step_collect_trends())
+        if raw == "d":
+            topic = _ask("  주제 직접 입력: ").strip()
+            if topic:
+                print(f"\n  ✓ 선택된 주제: {topic}")
+                return topic
+            continue
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(all_topics):
+                topic = all_topics[idx]
+                print(f"\n  ✓ 선택된 주제: {topic}")
+                return topic
+        except ValueError:
+            pass
+        print("  올바른 번호 또는 d/r을 입력하세요.")
+
+
+def _step_pick_action() -> str:
+    print("\n" + "─" * 52)
+    print(" [3/6] 무엇을 만들까요?")
+    print("─" * 52)
+    print("  1. 트윗만 작성")
+    print("  2. 쇼츠만 제작")
+    print("  3. 트윗 + 쇼츠 둘 다")
+    print()
+    while True:
+        raw = _ask("  선택 (1/2/3): ").strip()
+        if raw == "1": return "tweet"
+        if raw == "2": return "shorts"
+        if raw == "3": return "both"
+        print("  1, 2, 3 중 하나를 입력하세요.")
+
+
+def _step_generate(topic: str, action: str, content: dict | None = None):
+    print("\n" + "─" * 52)
+    print(" [4/6] AI 콘텐츠 생성 중...")
+    print("─" * 52)
+
+    if content is None:
+        content = {"title": topic, "text": topic, "source": "direct"}
+
+    twitter_ctx = content.get("twitter_context")
+    if not twitter_ctx:
+        try:
+            print("  → 트위터 관련 트윗 수집 중...")
+            from twitter_fetcher import _fetch_related_tweets, _extract_keywords, _headers
+            h  = _headers()
+            kw = _extract_keywords(topic)
+            related = _fetch_related_tweets(kw, "", h, max_results=10)
+            if related:
+                twitter_ctx = {
+                    "quote_tweets": [],
+                    "related": related,
+                    "summary": {
+                        "sentiment_hint": "",
+                        "combined_text":  "\n".join(f"- {t['text']}" for t in related[:5]),
+                    },
+                }
+        except Exception as e:
+            print(f"  ⚠️  트위터 수집 생략: {e}")
+
+    print("  → 뉴스/웹 검색 중...")
+    news_ctx = fetch_topic_context(topic)
+    sources  = news_ctx.get("sources_used", [])
+
+    print("  → 스크립트 생성 중...")
+    if twitter_ctx or news_ctx.get("news") or news_ctx.get("web"):
+        script = generate_rich_script(
+            topic=topic,
+            context={"twitter": twitter_ctx, "news": news_ctx},
+        )
+        print(f"  → 종합 스크립트 완료 (소스: {', '.join(sources) if sources else '트위터만'})")
+    else:
+        script = generate_script(content)
+
+    tweet_drafts = None
+    if action in ("tweet", "both"):
+        print("  → 트윗 초안 생성 중...")
+        tweet_drafts = generate_tweet_drafts(topic, script)
+
+    image_path = tts_path = video_path = None
+    if action in ("shorts", "both"):
+        print("  → 이미지 수집 중...")
+        image_path = fetch_image(
+            keywords=script.get("keywords", []),
+            output_dir=OUTPUT_DIR,
+            pexels_key=os.environ.get("PEXELS_API_KEY", ""),
+        )
+        print("  → TTS 음성 생성 중...")
+        tts_path = generate_tts(script, OUTPUT_DIR)
+        print("  → 영상 조립 중...")
+        video_path = assemble_video(
+            script=script,
+            tts_path=tts_path,
+            output_path=OUTPUT_DIR / "shorts.mp4",
+            image_path=image_path,
+            pexels_key=os.environ.get("PEXELS_API_KEY", ""),
+        )
+
+    print("  ✓ 생성 완료!")
+    return script, tweet_drafts, image_path, tts_path, video_path
+
+
+def _step_review(topic, action, script, tweet_drafts, image_path):
+    chosen_tweet = None
+    while True:
+        print("\n" + "─" * 52)
+        print(" [5/6] 최종 확인")
+        print("─" * 52)
+        print("\n  [ 쇼츠 스크립트 ]")
+        print(f"  Hook  : {script['hook']}")
+        for i, b in enumerate(script.get('body', []), 1):
+            print(f"  Body {i}: {b}")
+        print(f"  Closer: {script['closer']}")
+        if tweet_drafts:
+            print("\n  [ 트윗 초안 ]")
+            for num, label, key in [("1","정보형","info"),("2","공감형","emotion"),("3","해시태그형","hashtag")]:
+                text = tweet_drafts.get(key, "")
+                print(f"  [{num}] {label}  ({len(text)}자)")
+                print(f"      {text}")
+        if action in ("shorts", "both"):
+            mp4 = OUTPUT_DIR / "shorts.mp4"
+            print(f"\n  [ 쇼츠 영상 ] {mp4} ({'존재' if mp4.exists() else '없음'})")
+        print("\n  ─────────────────────────────────")
+        if tweet_drafts:
+            print("  tw1 / tw2 / tw3  — 트윗 버전 선택")
+        print("  s:내용   — 스크립트 재생성  (예: s:더 강렬하게)")
+        print("  t:내용   — 트윗 재생성      (예: t:더 재미있게)")
+        print("  ok       — 업로드 진행")
+        print("  q        — 종료")
+        print()
+        raw = _ask("  입력: ").strip().lower()
+        if raw == "ok":
+            if tweet_drafts and chosen_tweet is None:
+                chosen_tweet = tweet_drafts.get("emotion", "")
+                print("  (트윗 버전 미선택 → 공감형 자동 선택)")
+            break
+        elif raw == "q":
+            print("  종료합니다.")
+            sys.exit(0)
+        elif tweet_drafts and raw in ("tw1", "tw2", "tw3"):
+            key = {"tw1": "info", "tw2": "emotion", "tw3": "hashtag"}[raw]
+            chosen_tweet = tweet_drafts[key]
+            print(f"  ✓ 트윗 선택: {chosen_tweet}")
+        elif raw.startswith("s:"):
+            inst = raw[2:].strip()
+            print(f"  → 스크립트 재생성 중 ({inst})...")
+            c = {"title": topic, "text": f"{topic}. {inst}", "source": "direct"}
+            script = generate_script(c)
+            if tweet_drafts:
+                tweet_drafts = generate_tweet_drafts(topic, script)
+            print("  ✓ 재생성 완료")
+        elif raw.startswith("t:"):
+            if not tweet_drafts:
+                print("  트윗 모드가 아닙니다.")
+                continue
+            inst = raw[2:].strip()
+            print(f"  → 트윗 재생성 중 ({inst})...")
+            ms = dict(script)
+            ms["hook"] = f"{script['hook']} ({inst})"
+            tweet_drafts = generate_tweet_drafts(topic, ms)
+            print("  ✓ 재생성 완료")
+        else:
+            print("  올바른 명령을 입력하세요.")
+    return script, tweet_drafts, chosen_tweet
+
+
+def _step_upload(action: str, chosen_tweet, video_path, topic: str, script: dict = None):
+    print("\n" + "─" * 52)
+    print(" [6/6] 업로드")
+    print("─" * 52)
+    if action in ("tweet", "both") and chosen_tweet:
+        print(f"\n  트윗 게시 예정:\n  {chosen_tweet}\n")
+        if _ask("  트윗 게시할까요? (y/n): ").strip().lower() == "y":
+            try:
+                result = post_tweet(chosen_tweet)
+                print(f"  ✓ 트윗 게시 완료: {result['url']}")
+            except Exception as e:
+                _err(f"트윗 게시 실패: {e}")
+        else:
+            print("  트윗 게시 건너뜀.")
+    if action in ("shorts", "both") and video_path and video_path.exists():
+        print(f"\n  쇼츠 파일: {video_path}")
+        secrets = Path(os.environ.get("YOUTUBE_CLIENT_SECRETS", "config/client_secrets.json"))
+        if not secrets.exists():
+            print("  ℹ️  client_secrets.json 없음 → 로컬 저장만")
+            print(f"  ✓ 쇼츠 저장 완료: {video_path.resolve()}")
+        else:
+            if _ask("  YouTube에 업로드할까요? (y/n): ").strip().lower() == "y":
+                privacy = _ask("  공개 범위 (public/unlisted/private) [기본: public]: ").strip()
+                if privacy not in ("public", "unlisted", "private"):
+                    privacy = "public"
+                try:
+                    result = upload_shorts(
+                        video_path=video_path,
+                        title=topic,
+                        tags=(script or {}).get("keywords", []),
+                        privacy=privacy,
+                    )
+                    print(f"  ✓ YouTube 업로드 완료: {result['url']}")
+                except Exception as e:
+                    _err(f"YouTube 업로드 실패: {e}")
+                    print(f"  파일은 로컬에 저장됨: {video_path.resolve()}")
+            else:
+                print(f"  업로드 건너뜀. 파일: {video_path.resolve()}")
+    print("\n  ✅ 파이프라인 완료!")
+
+
+def _ask(prompt: str) -> str:
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print("\n  중단됨.")
+        sys.exit(0)
+
+
+def _err(msg: str):
+    print(f"\n  ⚠️  {msg}")
+
+
+def _print_banner():
+    print("\n" + "=" * 52)
+    print("  Shorts & Tweet 자동화 파이프라인")
+    print("=" * 52)
+
+
+if __name__ == "__main__":
+    run()
