@@ -19,28 +19,25 @@ notion_archiver.py
           └── YouTube 링크 (업로드된 경우)
 
 필요:
-  NOTION_TOKEN    — Notion Integration Token
-  NOTION_PARENT_PAGE_ID — 부모 페이지 ID (TwiterTrend)
+  NOTION_TOKEN           — Notion Integration Token
+  NOTION_PARENT_PAGE_ID  — 부모 페이지 ID (기본값: TwiterTrend 페이지)
 
 설치:
   pip install notion-client
 
 사용법:
-  # 직접 실행 (테스트)
-  python notion_archiver.py --test
-
-  # 파이프라인에서 자동 호출
-  from notion_archiver import archive_daily
-  archive_daily(trends, topic, script, tweet_drafts, youtube_url)
+  python notion_archiver.py --test   # 더미 데이터로 테스트
+  from notion_archiver import archive_daily  # 파이프라인에서 호출
 """
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from notion_client import Client
 
+# TwiterTrend 페이지 ID (MCP-Test 하위)
 PARENT_PAGE_ID = os.environ.get(
-    "NOTION_PARENT_PAGE_ID", "3336d03a-ed91-80e4-82a4-cb1c02f0d9e1"
+    "NOTION_PARENT_PAGE_ID", "3336d03a-ed91-8196-97aa-fade80e91783"
 )
 
 
@@ -56,24 +53,22 @@ def archive_daily(
 ) -> str:
     """
     오늘 날짜 Notion 페이지 생성 후 데이터 채우기.
-
     반환: 생성된 Notion 페이지 URL
     """
     token = os.environ.get("NOTION_TOKEN", "")
     if not token:
         raise ValueError(
             "NOTION_TOKEN 환경변수가 없습니다.\n"
-            "Notion Integration Token을 설정해주세요.\n"
             "발급: https://www.notion.so/profile/integrations"
         )
 
-    notion = Client(auth=token)
-    today  = datetime.now().strftime("%Y-%m-%d")
+    notion  = Client(auth=token)
+    today   = datetime.now().strftime("%Y-%m-%d")
     weekday = _weekday_ko()
 
     print(f"  → Notion 페이지 생성 중: {today}...")
 
-    # 1. 날짜 제목으로 새 페이지 생성
+    # 날짜 제목으로 새 페이지 생성
     page = notion.pages.create(
         parent={"page_id": PARENT_PAGE_ID},
         properties={
@@ -86,24 +81,16 @@ def archive_daily(
     page_id  = page["id"]
     page_url = f"https://www.notion.so/{page_id.replace('-', '')}"
 
-    # 2. 콘텐츠 블록 추가
+    # 콘텐츠 블록 구성
     blocks = []
-
-    # 트렌드 섹션
     blocks += _build_trends_section(trends)
-
-    # 주제 & 스크립트 섹션
     if topic or script:
         blocks += _build_script_section(topic, script)
-
-    # 트윗 초안 섹션
     if tweet_drafts:
         blocks += _build_tweet_section(tweet_drafts)
-
-    # 쇼츠 영상 섹션
     blocks += _build_video_section(youtube_url, video_path)
 
-    # 블록 추가 (한 번에 최대 100개)
+    # 블록 추가 (최대 100개씩)
     for i in range(0, len(blocks), 100):
         notion.blocks.children.append(
             block_id=page_id,
@@ -117,10 +104,7 @@ def archive_daily(
 # ─── 섹션 빌더 ───────────────────────────────────────────────
 
 def _build_trends_section(trends: dict | None) -> list:
-    blocks = [
-        _heading2("📊 오늘의 트렌드"),
-    ]
-
+    blocks = [_heading2("📊 오늘의 트렌드")]
     if not trends:
         blocks.append(_paragraph("트렌드 데이터 없음"))
         return blocks
@@ -146,92 +130,62 @@ def _build_trends_section(trends: dict | None) -> list:
 
 def _build_script_section(topic: str, script: dict | None) -> list:
     blocks = [_heading2("📝 선택된 주제 & 스크립트")]
-
     if topic:
         blocks.append(_paragraph(f"주제: {topic}"))
-
     if not script:
         return blocks
-
     blocks.append(_heading3("스크립트"))
     blocks.append(_bullet(f"Hook: {script.get('hook', '')}"))
-
     for i, b in enumerate(script.get("body", []), 1):
         blocks.append(_bullet(f"Body {i}: {b}"))
-
     blocks.append(_bullet(f"Closer: {script.get('closer', '')}"))
     blocks.append(_paragraph(
         f"키워드: {', '.join(script.get('keywords', []))}  |  분위기: {script.get('mood', '')}"
     ))
-
     return blocks
 
 
 def _build_tweet_section(tweet_drafts: dict) -> list:
     blocks = [_heading2("🐦 트윗 초안")]
-
-    labels = {"info": "정보형", "emotion": "공감형", "hashtag": "해시태그형"}
-    for key, label in labels.items():
+    for key, label in {"info": "정보형", "emotion": "공감형", "hashtag": "해시태그형"}.items():
         text = tweet_drafts.get(key, "")
         if text:
             blocks.append(_heading3(label))
             blocks.append(_paragraph(text))
-
     return blocks
 
 
 def _build_video_section(youtube_url: str, video_path: str) -> list:
     blocks = [_heading2("🎬 쇼츠 영상")]
-
     if youtube_url:
         blocks.append(_paragraph(f"YouTube: {youtube_url}"))
     elif video_path:
         blocks.append(_paragraph(f"로컬 파일: {video_path}"))
     else:
         blocks.append(_paragraph("영상 없음 (트윗만 생성된 경우)"))
-
     return blocks
 
 
 # ─── 블록 헬퍼 ───────────────────────────────────────────────
 
 def _heading2(text: str) -> dict:
-    return {
-        "object": "block",
-        "type": "heading_2",
-        "heading_2": {"rich_text": [{"type": "text", "text": {"content": text}}]},
-    }
-
+    return {"object": "block", "type": "heading_2",
+            "heading_2": {"rich_text": [{"type": "text", "text": {"content": text}}]}}
 
 def _heading3(text: str) -> dict:
-    return {
-        "object": "block",
-        "type": "heading_3",
-        "heading_3": {"rich_text": [{"type": "text", "text": {"content": text}}]},
-    }
-
+    return {"object": "block", "type": "heading_3",
+            "heading_3": {"rich_text": [{"type": "text", "text": {"content": text}}]}}
 
 def _paragraph(text: str) -> dict:
-    return {
-        "object": "block",
-        "type": "paragraph",
-        "paragraph": {"rich_text": [{"type": "text", "text": {"content": text}}]},
-    }
-
+    return {"object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": [{"type": "text", "text": {"content": text}}]}}
 
 def _bullet(text: str) -> dict:
-    return {
-        "object": "block",
-        "type": "bulleted_list_item",
-        "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": text}}]},
-    }
-
-
-# ─── 유틸 ────────────────────────────────────────────────────
+    return {"object": "block", "type": "bulleted_list_item",
+            "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": text}}]}}
 
 def _weekday_ko() -> str:
-    days = ["월", "화", "수", "목", "금", "토", "일"]
-    return days[datetime.now().weekday()]
+    return ["월", "화", "수", "목", "금", "토", "일"][datetime.now().weekday()]
 
 
 # ─── CLI 테스트 ───────────────────────────────────────────────
@@ -243,37 +197,32 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.test:
-        dummy_trends = {
-            "timeline": [
-                {"rank": 1, "topic": "서인영 유튜브 복귀", "rt_count": 4200, "tweet_count": 12},
-                {"rank": 2, "topic": "갤럭시 S25 언팩",   "rt_count": 3800, "tweet_count": 8},
-                {"rank": 3, "topic": "손흥민 해트트릭",   "rt_count": 3100, "tweet_count": 15},
-            ],
-            "trending": [
-                {"rank": 1, "topic": "이재명 판결",    "tweet_volume": 85000},
-                {"rank": 2, "topic": "설 연휴 기차표", "tweet_volume": 62000},
-                {"rank": 3, "topic": "AI 일자리 대체", "tweet_volume": 41000},
-            ],
-        }
-        dummy_script = {
-            "hook":     "서인영이 돌아왔다. 그것도 유튜브로.",
-            "body":     ["10년 공백을 깨고 첫 영상 100만뷰", "팬들 반응 둘로 갈렸다"],
-            "closer":   "여러분은 어떻게 생각하세요?",
-            "keywords": ["서인영", "유튜브복귀", "레전드"],
-            "mood":     "dramatic",
-        }
-        dummy_tweets = {
-            "info":    "서인영 유튜브 복귀, 첫 영상 100만뷰 돌파. 역시 레전드.",
-            "emotion": "서인영 언니 돌아왔다!! 진짜 기다렸어 🔥",
-            "hashtag": "서인영이 돌아왔다 #서인영 #유튜브복귀 #레전드",
-        }
-
         url = archive_daily(
-            trends=dummy_trends,
+            trends={
+                "timeline": [
+                    {"rank": 1, "topic": "서인영 유튜브 복귀", "rt_count": 4200, "tweet_count": 12},
+                    {"rank": 2, "topic": "갤럭시 S25 언팩",   "rt_count": 3800, "tweet_count": 8},
+                    {"rank": 3, "topic": "손흥민 해트트릭",   "rt_count": 3100, "tweet_count": 15},
+                ],
+                "trending": [
+                    {"rank": 1, "topic": "이재명 판결",    "tweet_volume": 85000},
+                    {"rank": 2, "topic": "설 연휴 기차표", "tweet_volume": 62000},
+                    {"rank": 3, "topic": "AI 일자리 대체", "tweet_volume": 41000},
+                ],
+            },
             topic="서인영 유튜브 복귀",
-            script=dummy_script,
-            tweet_drafts=dummy_tweets,
-            youtube_url="",
+            script={
+                "hook":     "서인영이 돌아왔다. 그것도 유튜브로.",
+                "body":     ["10년 공백을 깨고 첫 영상 100만뷰", "팬들 반응 둘로 갈렸다"],
+                "closer":   "여러분은 어떻게 생각하세요?",
+                "keywords": ["서인영", "유튜브복귀", "레전드"],
+                "mood":     "dramatic",
+            },
+            tweet_drafts={
+                "info":    "서인영 유튜브 복귀, 첫 영상 100만뷰 돌파. 역시 레전드.",
+                "emotion": "서인영 언니 돌아왔다!! 진짜 기다렸어 🔥",
+                "hashtag": "서인영이 돌아왔다 #서인영 #유튜브복귀 #레전드",
+            },
         )
         print(f"\n✅ 테스트 완료: {url}")
     else:
