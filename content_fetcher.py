@@ -9,6 +9,8 @@ content_fetcher.py
   - Google CSE:  GOOGLE_CSE_KEY + GOOGLE_CSE_ID
   - Bing 검색:   BING_SEARCH_KEY
   - 폴백:        네이버 뉴스 RSS (무료, 키 불필요)
+
+네이버 블로그는 모바일 URL로 자동 변환하여 크롤링합니다.
 """
 import os
 import re
@@ -32,7 +34,7 @@ def fetch_content(url: str) -> dict:
     if _is_twitter_url(url):
         return _prompt_twitter_text(url)
 
-    # 네이버 블로그 → 모바일 URL로 변환 (본문 크롤링 가능)
+    # 네이버 블로그 → 모바일 URL로 변환
     if "blog.naver.com" in url:
         url = _naver_blog_to_mobile(url)
 
@@ -101,10 +103,6 @@ def _prompt_twitter_text(url: str) -> dict:
 
 
 def fetch_topic_context(topic: str, max_results: int = 5) -> dict:
-    """
-    주제 키워드 → 뉴스 + 웹 검색 결과 종합.
-    반환: {news, web, combined_text, sources_used}
-    """
     news, web, sources_used = [], [], []
 
     naver_id     = os.environ.get("NAVER_CLIENT_ID", "")
@@ -196,8 +194,7 @@ def _search_google(topic, api_key, cse_id, max_results):
     try:
         resp = requests.get(
             "https://www.googleapis.com/customsearch/v1",
-            params={"key": api_key, "cx": cse_id, "q": topic,
-                    "num": max_results, "gl": "kr", "lr": "lang_ko"},
+            params={"key": api_key, "cx": cse_id, "q": topic, "num": max_results, "gl": "kr", "lr": "lang_ko"},
             timeout=10,
         )
         resp.raise_for_status()
